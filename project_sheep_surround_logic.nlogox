@@ -1461,7 +1461,7 @@ if ticks = 100 [ print (word "Run started: " num-sheep " sheep") ]</go>
         </enumeratedValueSet>
       </constants>
     </experiment>
-    <experiment name="find_best_wolf_number" repetitions="10" sequentialRunOrder="true" runMetricsEveryStep="false">
+    <experiment name="find-best-dog-number-surround" repetitions="10" sequentialRunOrder="false" runMetricsEveryStep="false">
       <setup>setup</setup>
       <go>go</go>
       <exitCondition><![CDATA[ticks >= 10000]]></exitCondition>
