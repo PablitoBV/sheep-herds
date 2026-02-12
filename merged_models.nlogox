@@ -1,0 +1,1917 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.2" snapToGrid="true">
+  <code><![CDATA[globals [
+  herd-center
+  herd-radius
+  current-goal
+  waypoints
+  waypoint-idx
+
+  ;; Metrics
+  score-accumulator
+  valid-ticks
+  tick-50pct
+  tick-80pct
+  tick-95pct
+  tick-100pct
+  current-run-seed
+  current-pct-in-target
+]
+
+breed [sheep a-sheep]
+breed [dogs dog]
+
+sheep-own [ 
+  vel-x vel-y
+  grazing? 
+  graze-timer 
+]
+
+;; =============================================================================
+;; SETUP
+;; =============================================================================
+
+to setup
+  clear-all
+  set current-run-seed new-seed
+  random-seed current-run-seed
+  
+  set herd-center [0 0]
+  set current-goal [0 0]
+  set waypoints []
+  set waypoint-idx 0
+  
+  set score-accumulator 0
+  set valid-ticks 0
+  set tick-50pct -1
+  set tick-80pct -1
+  set tick-95pct -1
+  set tick-100pct -1
+  set current-pct-in-target 0
+
+  if not is-string? scenario [ set scenario "Open Field" ]
+
+  draw-scenario
+  spawn-agents
+  reset-ticks
+  
+  print (word "--- Run: " num-dogs " dogs | " num-sheep " sheep | Dog Speed: " dog-speed " | Seed: " current-run-seed " ---")
+end
+
+to spawn-agents 
+  create-sheep num-sheep [ ; create sheep and set up their parameters, spawn in random spot
+    set shape "sheep"
+    set color white
+    set size 1.5
+    set vel-x 0 
+    set vel-y 0
+    set grazing? false
+    set graze-timer 0
+    
+    setxy 0 0
+    let safe? false
+    while [not safe?] [
+       setxy (random-xcor * 0.8) (random-ycor * 0.8)
+       if [pcolor] of patch-here != black [ set safe? true ]
+    ]
+    
+    set heading random 360
+    let init-speed (max-speed * 0.2)
+    set vel-x (sin heading * init-speed)
+    set vel-y (cos heading * init-speed)
+  ]
+
+  create-dogs num-dogs [ ; create sheep and set up their parameters, spawn in random spot
+    set shape "wolf"
+    set color orange 
+    set size 2
+    
+    setxy 0 0 
+    let safe? false
+    while [not safe?] [
+       setxy (random-xcor * 0.9) (random-ycor * 0.9)
+       if [pcolor] of patch-here != black [ set safe? true ]
+    ]
+  ]
+end
+
+;; =============================================================================
+;; MAIN LOOP
+;; =============================================================================
+
+to go
+  if ticks >= 100000 [ stop ] ;saftey stop at 100k ticks
+
+  calc-herd-metrics
+  update-scenario-goals
+
+  ask sheep [ sheep-behavior-strombom ]
+  
+  let sorted-dogs sort dogs
+  let total-dogs count dogs
+  foreach sorted-dogs [ d ->
+    ask d [ dog-behavior (position d sorted-dogs) total-dogs ]
+  ]
+
+  update-metrics
+  tick
+end
+
+;; =============================================================================
+;; SHEEP LOGIC (Strombom k-NN)
+;; =============================================================================
+
+to sheep-behavior-strombom ; Sheep moving from löogic from the Strombom paper
+  let dt 0.2
+  let k k-neighbors 
+  
+  ;; 1. Fear of dogs vector
+  let nearby-dogs dogs in-radius 10
+  let is-afraid? false
+  let fear-vec-x 0 
+  let fear-vec-y 0 
+
+  if any? nearby-dogs [
+    ask nearby-dogs [
+      let d distance myself
+      if d < 10 and d > 0 [ 
+        set is-afraid? true
+        let diff-x ([xcor] of myself - xcor)
+        let diff-y ([ycor] of myself - ycor)
+        let repulsion (1 / (d * d)) * fear-of-dogs 
+        set fear-vec-x fear-vec-x + (diff-x * repulsion)
+        set fear-vec-y fear-vec-y + (diff-y * repulsion)
+      ]
+    ]
+  ]
+  if is-afraid? [ set grazing? false ]
+
+  ;; 2. Interaction between sheeps (separation vector, cohesion vector and alignment vector)
+  ifelse grazing? [
+    set vel-x 0 set vel-y 0
+    set graze-timer graze-timer - 1
+    if graze-timer <= 0 [ set grazing? false ]
+    if count other sheep in-radius 2.0 > 3 [ set grazing? false ]
+  ] [
+    let neighbors-list (ifelse-value (count other sheep >= k)
+      [ sublist sort-on [distance myself] other sheep 0 k ]
+      [ sort-on [distance myself] other sheep ])
+      
+    let neighbor-set turtle-set neighbors-list
+    let sep-vec-x 0   let sep-vec-y 0
+    let align-vec-x 0 let align-vec-y 0
+    let coh-vec-x 0   let coh-vec-y 0
+    
+    if not empty? neighbors-list [
+      foreach neighbors-list [ n ->
+        let d distance n
+        if (d < separation-distance and d > 0) [
+          let away-x (xcor - [xcor] of n)
+          let away-y (ycor - [ycor] of n)
+          set sep-vec-x sep-vec-x + (away-x / (d * d))
+          set sep-vec-y sep-vec-y + (away-y / (d * d))
+        ]
+      ]
+    ]
+
+    if any? neighbor-set [
+      set align-vec-x mean [vel-x] of neighbor-set
+      set align-vec-y mean [vel-y] of neighbor-set
+      set coh-vec-x ((mean [xcor] of neighbor-set) - xcor)
+      set coh-vec-y ((mean [ycor] of neighbor-set) - ycor)
+    ]
+  
+    ;; 3. Wall avoidance vector
+    let wall-vec-x 0 let wall-vec-y 0
+    let scan-dist 2.0
+    let ahead-x xcor + vel-x * scan-dist
+    let ahead-y ycor + vel-y * scan-dist
+    
+    if ahead-x > max-pxcor [ set ahead-x max-pxcor ]
+    if ahead-x < min-pxcor [ set ahead-x min-pxcor ]
+    if ahead-y > max-pycor [ set ahead-y max-pycor ]
+    if ahead-y < min-pycor [ set ahead-y min-pycor ]
+    
+    if [pcolor] of patch ahead-x ahead-y = black [
+       let wx ahead-x - xcor
+       let wy ahead-y - ycor
+       set wall-vec-x (-1 * wx * 50) 
+       set wall-vec-y (-1 * wy * 50)
+    ]
+    
+    ;; Combine all relevant vectors
+    let ax (sep-vec-x * separation-weight) + (align-vec-x * alignment-weight) + (coh-vec-x * cohesion-weight) + (fear-vec-x * 8.0) + wall-vec-x
+    let ay (sep-vec-y * separation-weight) + (align-vec-y * alignment-weight) + (coh-vec-y * cohesion-weight) + (fear-vec-y * 8.0) + wall-vec-y
+    
+    set vel-x vel-x + (ax * dt)
+    set vel-y vel-y + (ay * dt)
+    set vel-x vel-x * 0.90 
+    set vel-y vel-y * 0.90
+    set vel-x vel-x + ((random-float (noise * 2) - noise) * dt)
+    set vel-y vel-y + ((random-float (noise * 2) - noise) * dt)
+    
+    let limit-speed (max-speed / 5.0) 
+    let v-mag sqrt (vel-x * vel-x + vel-y * vel-y)
+    if v-mag > limit-speed [ 
+      set vel-x (vel-x / v-mag) * limit-speed 
+      set vel-y (vel-y / v-mag) * limit-speed 
+    ]
+    
+    if v-mag > 0.01 [ set heading atan vel-x vel-y ]
+    
+    let next-x xcor + (vel-x * dt)
+    let next-y ycor + (vel-y * dt)
+    
+    if next-x > max-pxcor [ set next-x max-pxcor set vel-x vel-x * -0.5 ]
+    if next-x < min-pxcor [ set next-x min-pxcor set vel-x vel-x * -0.5 ]
+    if next-y > max-pycor [ set next-y max-pycor set vel-y vel-y * -0.5 ]
+    if next-y < min-pycor [ set next-y min-pycor set vel-y vel-y * -0.5 ]
+
+    ifelse [pcolor] of patch next-x next-y != black [
+      set xcor next-x 
+      set ycor next-y
+    ] [
+      set vel-x 0
+      set vel-y 0
+    ]
+    
+    if not is-afraid? [
+      if random-float 100 < 5.0 [ 
+        set grazing? true 
+        set graze-timer 250 + random 50 
+      ]
+    ]
+  ]
+end
+
+;; =============================================================================
+;; DOG LOGIC
+;; =============================================================================
+
+to dog-behavior [ rank total-dogs ]
+  let cx item 0 herd-center
+  let cy item 1 herd-center
+  
+  let target-x 0
+  let target-y 0
+  let is-collecting? false
+  
+  ;; --- Shared sensing of the straggler, the furthest sheep from the sheep-centroid
+  let straggler nobody
+  let dist-straggler 0
+
+  ifelse scenario = "Enclosure" [
+    set straggler max-one-of sheep with [abs xcor > 9 or abs ycor > 9] [distancexy cx cy]
+    if straggler = nobody [ set straggler max-one-of sheep [distancexy cx cy] ]
+  ] [
+    set straggler max-one-of sheep [distancexy cx cy]
+  ]
+  if straggler != nobody [ set dist-straggler [distancexy cx cy] of straggler ]
+
+
+  ;; --- Strategy switching ---
+
+  if dog-strategy = "Surround" [
+    set color orange
+    
+    ; DRIVE LOGIC (push sheep towards goal)
+    let focus-x cx
+    let focus-y cy
+    
+    if scenario != "Open Field" [
+       let gx item 0 current-goal
+       let gy item 1 current-goal
+       let dist-to-goal sqrt ((gx - cx)^ 2 + (gy - cy)^ 2)
+       
+       ; Shift the center of the orbit 3.0 units towards the goal
+       if dist-to-goal > 0 [
+          set focus-x cx + ((gx - cx) / dist-to-goal) * 3.0
+          set focus-y cy + ((gy - cy) / dist-to-goal) * 3.0
+       ]
+    ]
+
+    ; SURROUND LOGIC (orbit around the sheep in a circle to contain them)
+    let max-spread 0
+    if any? sheep [ set max-spread max [distancexy cx cy] of sheep ]
+    
+    ; Orbit dist is max(10, spread + 5)
+    let orbit-dist max (list 10 (max-spread + 5))
+    
+    let angle-step 360 / total-dogs
+    let my-angle (rank * angle-step)
+    
+    set target-x focus-x + (sin my-angle * orbit-dist)
+    set target-y focus-y + (cos my-angle * orbit-dist)
+
+    ; If a straggler is > 15 units away, the closest dog breaks formation to get it
+    if straggler != nobody and  dist-straggler > (herd-threshold * 0.6)[
+       let closest-dog min-one-of dogs [distance straggler]
+       if closest-dog = self [
+          set is-collecting? true
+          set color blue
+          
+          let sx [xcor] of straggler
+          let sy [ycor] of straggler
+          let v-len distancexy sx sy
+          if v-len = 0 [ set v-len 0.001 ]
+          
+          ; Target a point behind the straggler relative to the herd center
+          let vec-x (sx - cx) / v-len
+          let vec-y (sy - cy) / v-len
+          set target-x sx + (vec-x * 4)
+          set target-y sy + (vec-y * 4)
+       ]
+    ]
+  ]
+
+  if dog-strategy = "Surround + Drive" [ ; Surround logic with 1 dog trying to catch stragglers while others just surround
+    ;; 1 dog is in charge of catching stragglers
+    ifelse (straggler != nobody and dist-straggler > (herd-threshold * 0.6)) and (rank = 0) [
+      set is-collecting? true
+      set color blue
+      let sx [xcor] of straggler
+      let sy [ycor] of straggler
+      let v-len distancexy sx sy
+      if v-len = 0 [ set v-len 0.001 ]
+      let vec-x (sx - cx) / v-len
+      let vec-y (sy - cy) / v-len
+      set target-x sx + (vec-x * 4)
+      set target-y sy + (vec-y * 4)
+    ] [
+      set color orange
+      let focus-x cx
+      let focus-y cy
+      let gx item 0 current-goal
+      let gy item 1 current-goal
+      
+      if scenario != "Open Field" [
+         let dist-to-goal sqrt ((gx - cx)^ 2 + (gy - cy)^ 2)
+         if dist-to-goal > 0 [
+           set focus-x cx + ((gx - cx) / dist-to-goal) * 3.0
+           set focus-y cy + ((gy - cy) / dist-to-goal) * 3.0
+         ]
+      ]
+      
+      let max-spread 0
+      if any? sheep [ set max-spread max [distancexy cx cy] of sheep ]
+      let orbit-dist max (list 10 (max-spread + 5))
+      let angle-step 360 / total-dogs
+      let my-angle (rank * angle-step)
+      set target-x focus-x + (sin my-angle * orbit-dist)
+      set target-y focus-y + (cos my-angle * orbit-dist)
+    ]
+  ]
+
+  if dog-strategy = "Rotate" [ ;; ROTATE logic:  1 dog catches stragglers, while others rotate around the herd
+    
+    ifelse (straggler != nobody and dist-straggler > (herd-threshold * 0.6)) and (rank = 0) [
+      set is-collecting? true
+      set color blue
+      let sx [xcor] of straggler
+      let sy [ycor] of straggler
+      let v-len distancexy sx sy
+      if v-len = 0 [ set v-len 0.001 ]
+      let vec-x (sx - cx) / v-len
+      let vec-y (sy - cy) / v-len
+      set target-x sx + (vec-x * 4)
+      set target-y sy + (vec-y * 4)
+    ] [
+      set color orange
+      let focus-x cx
+      let focus-y cy
+      let gx item 0 current-goal
+      let gy item 1 current-goal
+      
+      if scenario != "Open Field" [
+         let dist-to-goal sqrt ((gx - cx)^ 2 + (gy - cy)^ 2)
+         if dist-to-goal > 0 [
+           set focus-x cx + ((gx - cx) / dist-to-goal) * 3.0
+           set focus-y cy + ((gy - cy) / dist-to-goal) * 3.0
+         ]
+      ]
+
+      let max-spread 0
+      if any? sheep [ set max-spread max [distancexy cx cy] of sheep ]
+      let orbit-dist max (list 10 (max-spread + 5))
+      
+      let angle-step 360 / total-dogs
+      let base-angle (rank * angle-step)
+      let patrol-offset (ticks * 2.0) 
+      let my-angle (base-angle + patrol-offset)
+      
+      set target-x focus-x + (sin my-angle * orbit-dist)
+      set target-y focus-y + (cos my-angle * orbit-dist)
+    ]
+  ]
+  
+  ;;;;;;;;;;;;;;;; Prevent dog from running directly through the herd center ;;;;;;;
+  let dist-herd distancexy cx cy
+  let dist-targ distancexy target-x target-y
+    
+  ;; Trigger conditions:
+  ;; 1. Herd center is closer than the target (herd is in the middle)
+  ;; 2. Dog is close to herd center (risk of splitting, buffer is radius + 5)
+  if (dist-herd < dist-targ) and (dist-herd < herd-radius + 5) and (dist-herd > 0) [
+     let ang-herd towardsxy cx cy
+     let ang-targ towardsxy target-x target-y
+       
+     ;; 3. Angle check: If target angle and herd center angle are similar (< 60 deg), path is blocked
+     if abs (subtract-headings ang-herd ang-targ) < 60 [
+        ;; Calculate detour direction: Go left or right?
+        let detour-turn 90
+        if subtract-headings ang-targ ang-herd < 0 [ set detour-turn -90 ]
+          
+        ;; Modify target: Set to a tangent point on the herd edge (radius + 4 safety distance)
+        ;; This makes the dog arc around the herd rather than through it
+        set target-x cx + (sin (ang-herd + detour-turn) * (herd-radius + 4))
+        set target-y cy + (cos (ang-herd + detour-turn) * (herd-radius + 4))
+     ]
+  ]
+
+  move-dog-smart target-x target-y cx cy is-collecting?
+end
+
+to move-dog-smart [tx ty cx cy collecting?]
+  let safe-pos sanitize-target tx ty cx cy
+  set tx item 0 safe-pos
+  set ty item 1 safe-pos
+  
+  let move-speed (max-speed / 5.0) * (dog-speed / 2.0)
+  let dist-to-target distancexy tx ty
+  
+  ;; Iterative braking (avoid overshoot which leads to dog jumping way too far leading to bad performance (mostly when dog was super fast)
+  let desired-speed min (list move-speed dist-to-target)
+  
+  if desired-speed > 0.1 [
+    facexy tx ty
+    let safe-speed 0
+    let test-speed desired-speed
+    let found-path? false
+    
+    while [test-speed > 0.1 and not found-path?] [
+       let p-check patch-ahead (test-speed + 0.5)
+       ifelse (p-check != nobody and [pcolor] of p-check != black) [
+         set safe-speed test-speed
+         set found-path? true
+       ] [
+         set test-speed test-speed * 0.5
+       ]
+    ]
+    
+    ifelse found-path? [
+       fd safe-speed
+    ] [
+       facexy cx cy
+       if can-move? move-speed [ fd move-speed ]
+    ]
+  ]
+  
+  ;; Orbiting adjustment (face inward)
+  if not collecting? and distancexy cx cy < (herd-radius + 2) [
+     set heading (towardsxy cx cy) + 180 
+     if can-move? move-speed [ fd move-speed ] 
+  ]
+end
+
+
+to-report sanitize-target [tx ty cx cy]
+  ;; 1. Clamp to world boundaries
+  if tx > max-pxcor [ set tx max-pxcor ] if tx < min-pxcor [ set tx min-pxcor ]
+  if ty > max-pycor [ set ty max-pycor ] if ty < min-pycor [ set ty min-pycor ]
+
+  ;; 2. Move towards center if inside a black wall
+  let attempts 0
+  
+  ;; check for walls iteratively (black colored walls)
+  while [ [pcolor] of patch tx ty = black and attempts < 100 ] [
+    let dist-rem sqrt ((cx - tx) ^ 2 + (cy - ty) ^ 2)
+    if dist-rem < 2 [ report (list cx cy) ] ;; Emergency exit to center
+    
+    let vx (cx - tx) / dist-rem
+    let vy (cy - ty) / dist-rem
+    
+    set tx (tx + vx * 2) ;; Step closer to herd
+    set ty (ty + vy * 2)
+    set attempts attempts + 1
+  ]
+  
+  report (list tx ty)
+end
+
+to calc-herd-metrics
+  ifelse count sheep > 0 [
+    let mx mean [xcor] of sheep
+    let my mean [ycor] of sheep
+    set herd-center (list mx my)
+    let max-dist 0
+    ask sheep [
+      let d distancexy mx my
+      if d > max-dist [ set max-dist d ]
+    ]
+    set herd-radius max-dist
+  ] [
+    set herd-center [0 0] set herd-radius 0
+  ]
+end
+
+;; =============================================================================
+;; SCENARIO CONTROL
+;; =============================================================================
+
+to draw-scenario
+  ask patches [ set pcolor green + 2 ]
+  
+  ;; World Borders
+  ask patches with [abs pxcor >= max-pxcor - 1 or abs pycor >= max-pycor - 1] [ set pcolor black ]
+  
+  if scenario = "Enclosure" [
+    ;; 12x12 target area
+    ask patches with [abs pxcor < 12 and abs pycor < 12] [ set pcolor brown ]
+    ;; Walls
+    ask patches with [(abs pxcor = 12 and abs pycor <= 12) or (abs pycor = 12 and abs pxcor <= 12)] [ set pcolor black ]
+    ;; Gate
+    ask patches with [pxcor = 12 and abs pycor < 5] [ set pcolor brown ]
+    set current-goal [15 0]
+  ]
+  
+  if scenario = "Path" [
+    ask patches with [abs pycor < 6] [ set pcolor brown + 2 ]
+    set waypoints (list (list (min-pxcor + 6) 0) (list 0 0) (list (max-pxcor - 6) 0))
+    set waypoint-idx 0 
+    set current-goal item 0 waypoints
+  ]
+  
+  if scenario = "Target" [
+    ask patches with [abs pxcor <= 6 and abs pycor <= 6] [ set pcolor brown ]
+    set current-goal [0 0]
+  ]
+end
+
+to update-scenario-goals
+  let cx item 0 herd-center
+  let cy item 1 herd-center
+  
+  if scenario = "Path" [
+    let target item waypoint-idx waypoints
+    let d sqrt ((cx - item 0 target) ^ 2 + (cy - item 1 target) ^ 2)
+    if d < 8 and waypoint-idx < (length waypoints - 1) [
+      set waypoint-idx waypoint-idx + 1 
+      set current-goal item waypoint-idx waypoints
+    ]
+  ]
+  
+  if scenario = "Enclosure" [
+    ifelse (abs cx < 12 and abs cy < 12) 
+      [ set current-goal [0 0] ] 
+      [ set current-goal [15 0] ]
+  ]
+end
+
+
+
+; METRICS -----------------------------------
+to update-metrics
+  let n count sheep with [abs xcor <= 6 and abs ycor <= 6]
+  set current-pct-in-target (n / num-sheep) * 100
+  if tick-50pct = -1 and current-pct-in-target >= 50 [ set tick-50pct ticks ]
+  if tick-80pct = -1 and current-pct-in-target >= 80 [ set tick-80pct ticks ]
+  if tick-95pct = -1 and current-pct-in-target >= 95 [ set tick-95pct ticks ]
+  if tick-100pct = -1 and current-pct-in-target >= 100 [ set tick-100pct ticks ]
+  
+  if ticks >= 2000 [ 
+    set score-accumulator (score-accumulator + n) 
+    set valid-ticks (valid-ticks + 1) 
+  ]
+end
+
+to-report get-success-percentage
+  if valid-ticks = 0 [ report 0 ]
+  report (score-accumulator / valid-ticks / num-sheep) * 100
+end
+
+
+
+
+
+to-report get-tick-50pct
+  report tick-50pct
+end
+
+to-report get-tick-80pct
+  report tick-80pct
+end
+
+to-report get-tick-95pct
+  report tick-95pct
+end
+
+to-report get-tick-100pct
+  report tick-100pct
+end]]></code>
+  <widgets>
+    <view x="350" wrappingAllowedX="false" y="5" frameRate="30.0" minPycor="-25" height="820" showTickCounter="true" patchSize="16.0" fontSize="10" wrappingAllowedY="false" width="820" tickCounterLabel="ticks" maxPycor="25" updateMode="0" maxPxcor="25" minPxcor="-25"></view>
+    <slider x="30" step="1" y="775" max="50" width="290" display="separation-weight" height="50" min="0" direction="Horizontal" default="15.0" variable="separation-weight"></slider>
+    <slider x="30" step="0.1" y="720" max="10" width="290" display="separation-distance" height="50" min="0" direction="Horizontal" default="3.0" variable="separation-distance"></slider>
+    <slider x="30" step="0.1" y="665" max="10" width="290" display="alignment-weight" height="50" min="0" direction="Horizontal" default="1.0" variable="alignment-weight"></slider>
+    <slider x="30" step="1" y="610" max="100" width="290" display="cohesion-weight" height="50" min="0" direction="Horizontal" default="60.0" variable="cohesion-weight"></slider>
+    <slider x="30" step="1" y="445" max="30" width="290" display="max-speed" height="50" min="0" direction="Horizontal" default="8.0" variable="max-speed"></slider>
+    <slider x="30" step="1" y="390" max="500" width="290" display="num-sheep" height="50" min="0" direction="Horizontal" default="300.0" variable="num-sheep"></slider>
+    <slider x="30" step="1" y="285" max="50" width="290" display="herd-threshold" height="50" min="0" direction="Horizontal" default="20.0" variable="herd-threshold"></slider>
+    <slider x="30" step="0.1" y="230" max="20" width="290" display="dog-speed" height="50" min="0" direction="Horizontal" default="2.0" variable="dog-speed"></slider>
+    <slider x="30" step="1" y="175" max="50" width="290" display="num-dogs" height="50" min="0" direction="Horizontal" default="3.0" variable="num-dogs"></slider>
+    <button x="135" y="15" height="50" disableUntilTicks="false" forever="true" kind="Observer" width="70" display="go">go</button>
+    <chooser x="30" y="75" height="60" variable="scenario" current="1" width="125" display="scenario">
+      <choice type="string" value="Open Field"></choice>
+      <choice type="string" value="Target"></choice>
+      <choice type="string" value="Path"></choice>
+      <choice type="string" value="Enclosure"></choice>
+    </chooser>
+    <note x="30" y="145" backgroundDark="-13210332" fontSize="14" width="145" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="-13210332">Dogs parameters
+ </note>
+    <note x="30" y="360" backgroundDark="-13210332" fontSize="14" width="145" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="-13210332">Sheep parameters</note>
+    <button x="30" y="15" height="50" disableUntilTicks="false" forever="false" kind="Observer" width="90" display="setup">setup</button>
+    <slider x="30" step="1" y="830" max="100" width="290" display="noise" height="50" min="0" direction="Horizontal" default="0.0" variable="noise"></slider>
+    <slider x="30" step="1" y="555" max="100" width="290" display="fear-of-dogs" height="50" min="0" direction="Horizontal" default="50.0" variable="fear-of-dogs"></slider>
+    <slider x="30" step="1" y="500" max="25" width="290" display="k-neighbors" height="50" min="0" direction="Horizontal" default="4.0" variable="k-neighbors"></slider>
+    <chooser x="160" y="75" height="60" variable="dog-strategy" current="1" width="185" display="dog-strategy">
+      <choice type="string" value="Surround"></choice>
+      <choice type="string" value="Surround + Drive"></choice>
+      <choice type="string" value="Rotate"></choice>
+    </chooser>
+    <plot x="1195" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="% in target" y="20" xMin="0.0" height="290" legend="false" xMax="10000.0" yMin="0.0" width="600" xAxis="Time" display="Sheep in Target">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="default" color="-5298144" legend="true">
+        <setup></setup>
+        <update>plot current-pct-in-target</update>
+      </pen>
+    </plot>
+    <plot x="1255" autoPlotX="true" yMax="50.0" autoPlotY="true" yAxis="Radius" y="365" xMin="0.0" height="175" legend="false" xMax="5000.0" yMin="0.0" width="230" xAxis="Time" display="Herd radius">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Radius" color="-5298144" legend="true">
+        <setup></setup>
+        <update>plot herd-radius</update>
+      </pen>
+    </plot>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="find-best-dog-number-hybrid" repetitions="10" sequentialRunOrder="false" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks > 10000]]></exitCondition>
+      <metrics>
+        <metric>get-success-percentage</metric>
+        <metric>get-tick-50pct</metric>
+        <metric>get-tick-80pct</metric>
+        <metric>get-tick-95pct</metric>
+        <metric>get-tick-100pct</metric>
+        <metric>current-run-seed</metric>
+        <metric>num-dogs</metric>
+        <metric>scenario</metric>
+        <metric>max-speed</metric>
+        <metric>dog-speed</metric>
+        <metric>k-neighbors</metric>
+        <metric>separation-distance</metric>
+        <metric>separation-weight</metric>
+        <metric>cohesion-weight</metric>
+        <metric>alignment-weight</metric>
+        <metric>fear-of-dogs</metric>
+        <metric>noise</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-dogs">
+          <value value="0"></value>
+          <value value="1"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="6"></value>
+          <value value="7"></value>
+          <value value="8"></value>
+          <value value="9"></value>
+          <value value="10"></value>
+          <value value="12"></value>
+          <value value="15"></value>
+          <value value="20"></value>
+          <value value="25"></value>
+          <value value="30"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-sheep">
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dog-speed">
+          <value value="0.5"></value>
+          <value value="0.7"></value>
+          <value value="1"></value>
+          <value value="1.2"></value>
+          <value value="1.4"></value>
+          <value value="1.7"></value>
+          <value value="2"></value>
+          <value value="2.5"></value>
+          <value value="3"></value>
+          <value value="3.5"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="7.5"></value>
+          <value value="10"></value>
+          <value value="15"></value>
+          <value value="20"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dog-strategy">
+          <value value="&quot;Surround + Drive&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="find-max-sheep-number-hybrid" repetitions="5" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 10000]]></exitCondition>
+      <metrics>
+        <metric>get-success-percentage</metric>
+        <metric>get-tick-50pct</metric>
+        <metric>get-tick-80pct</metric>
+        <metric>get-tick-95pct</metric>
+        <metric>get-tick-100pct</metric>
+        <metric>current-run-seed</metric>
+        <metric>num-dogs</metric>
+        <metric>scenario</metric>
+        <metric>max-speed</metric>
+        <metric>dog-speed</metric>
+        <metric>k-neighbors</metric>
+        <metric>separation-distance</metric>
+        <metric>separation-weight</metric>
+        <metric>cohesion-weight</metric>
+        <metric>alignment-weight</metric>
+        <metric>fear-of-dogs</metric>
+        <metric>noise</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-dogs">
+          <value value="0"></value>
+          <value value="1"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="6"></value>
+          <value value="7"></value>
+          <value value="8"></value>
+          <value value="9"></value>
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-sheep">
+          <value value="20"></value>
+          <value value="50"></value>
+          <value value="100"></value>
+          <value value="200"></value>
+          <value value="300"></value>
+          <value value="400"></value>
+          <value value="500"></value>
+          <value value="700"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dog-speed">
+          <value value="1"></value>
+          <value value="1.5"></value>
+          <value value="2"></value>
+          <value value="2.5"></value>
+          <value value="3"></value>
+          <value value="3.5"></value>
+          <value value="4"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dog-strategy">
+          <value value="&quot;Surround + Drive&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="find-max-sheep-number-rotate" repetitions="5" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 10000]]></exitCondition>
+      <metrics>
+        <metric>get-success-percentage</metric>
+        <metric>get-tick-50pct</metric>
+        <metric>get-tick-80pct</metric>
+        <metric>get-tick-95pct</metric>
+        <metric>get-tick-100pct</metric>
+        <metric>current-run-seed</metric>
+        <metric>num-dogs</metric>
+        <metric>scenario</metric>
+        <metric>max-speed</metric>
+        <metric>dog-speed</metric>
+        <metric>k-neighbors</metric>
+        <metric>separation-distance</metric>
+        <metric>separation-weight</metric>
+        <metric>cohesion-weight</metric>
+        <metric>alignment-weight</metric>
+        <metric>fear-of-dogs</metric>
+        <metric>noise</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-dogs">
+          <value value="0"></value>
+          <value value="1"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="6"></value>
+          <value value="7"></value>
+          <value value="8"></value>
+          <value value="9"></value>
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-sheep">
+          <value value="20"></value>
+          <value value="50"></value>
+          <value value="100"></value>
+          <value value="200"></value>
+          <value value="300"></value>
+          <value value="400"></value>
+          <value value="500"></value>
+          <value value="700"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dog-speed">
+          <value value="1"></value>
+          <value value="1.5"></value>
+          <value value="2"></value>
+          <value value="2.5"></value>
+          <value value="3"></value>
+          <value value="3.5"></value>
+          <value value="4"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dog-strategy">
+          <value value="&quot;Rotate&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="find-best-dog-number-rotate" repetitions="10" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 10000]]></exitCondition>
+      <metrics>
+        <metric>get-success-percentage</metric>
+        <metric>get-tick-50pct</metric>
+        <metric>get-tick-80pct</metric>
+        <metric>get-tick-95pct</metric>
+        <metric>get-tick-100pct</metric>
+        <metric>current-run-seed</metric>
+        <metric>num-dogs</metric>
+        <metric>scenario</metric>
+        <metric>max-speed</metric>
+        <metric>dog-speed</metric>
+        <metric>k-neighbors</metric>
+        <metric>separation-distance</metric>
+        <metric>separation-weight</metric>
+        <metric>cohesion-weight</metric>
+        <metric>alignment-weight</metric>
+        <metric>fear-of-dogs</metric>
+        <metric>noise</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-dogs">
+          <value value="0"></value>
+          <value value="1"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="6"></value>
+          <value value="7"></value>
+          <value value="8"></value>
+          <value value="9"></value>
+          <value value="10"></value>
+          <value value="12"></value>
+          <value value="15"></value>
+          <value value="20"></value>
+          <value value="25"></value>
+          <value value="30"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-sheep">
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dog-speed">
+          <value value="0.5"></value>
+          <value value="0.7"></value>
+          <value value="1"></value>
+          <value value="1.2"></value>
+          <value value="1.4"></value>
+          <value value="1.7"></value>
+          <value value="2"></value>
+          <value value="2.5"></value>
+          <value value="3"></value>
+          <value value="3.5"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="7.5"></value>
+          <value value="10"></value>
+          <value value="15"></value>
+          <value value="20"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dog-strategy">
+          <value value="&quot;Rotate&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="find-best-dog-number-surround" repetitions="10" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 10000]]></exitCondition>
+      <metrics>
+        <metric>get-success-percentage</metric>
+        <metric>get-tick-50pct</metric>
+        <metric>get-tick-80pct</metric>
+        <metric>get-tick-95pct</metric>
+        <metric>get-tick-100pct</metric>
+        <metric>current-run-seed</metric>
+        <metric>num-dogs</metric>
+        <metric>scenario</metric>
+        <metric>max-speed</metric>
+        <metric>dog-speed</metric>
+        <metric>k-neighbors</metric>
+        <metric>separation-distance</metric>
+        <metric>separation-weight</metric>
+        <metric>cohesion-weight</metric>
+        <metric>alignment-weight</metric>
+        <metric>fear-of-dogs</metric>
+        <metric>noise</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-dogs">
+          <value value="0"></value>
+          <value value="1"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="6"></value>
+          <value value="7"></value>
+          <value value="8"></value>
+          <value value="9"></value>
+          <value value="10"></value>
+          <value value="12"></value>
+          <value value="15"></value>
+          <value value="20"></value>
+          <value value="25"></value>
+          <value value="30"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-sheep">
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dog-speed">
+          <value value="0.5"></value>
+          <value value="0.7"></value>
+          <value value="1"></value>
+          <value value="1.2"></value>
+          <value value="1.4"></value>
+          <value value="1.7"></value>
+          <value value="2"></value>
+          <value value="2.5"></value>
+          <value value="3"></value>
+          <value value="3.5"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="7.5"></value>
+          <value value="10"></value>
+          <value value="15"></value>
+          <value value="20"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dog-strategy">
+          <value value="&quot;Surround&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="find-max-sheep-number-surround" repetitions="5" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 10000]]></exitCondition>
+      <metrics>
+        <metric>get-success-percentage</metric>
+        <metric>get-tick-50pct</metric>
+        <metric>get-tick-80pct</metric>
+        <metric>get-tick-95pct</metric>
+        <metric>get-tick-100pct</metric>
+        <metric>current-run-seed</metric>
+        <metric>num-dogs</metric>
+        <metric>scenario</metric>
+        <metric>max-speed</metric>
+        <metric>dog-speed</metric>
+        <metric>k-neighbors</metric>
+        <metric>separation-distance</metric>
+        <metric>separation-weight</metric>
+        <metric>cohesion-weight</metric>
+        <metric>alignment-weight</metric>
+        <metric>fear-of-dogs</metric>
+        <metric>noise</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-dogs">
+          <value value="0"></value>
+          <value value="1"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="6"></value>
+          <value value="7"></value>
+          <value value="8"></value>
+          <value value="9"></value>
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-sheep">
+          <value value="20"></value>
+          <value value="50"></value>
+          <value value="100"></value>
+          <value value="200"></value>
+          <value value="300"></value>
+          <value value="400"></value>
+          <value value="500"></value>
+          <value value="700"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dog-speed">
+          <value value="1"></value>
+          <value value="1.5"></value>
+          <value value="2"></value>
+          <value value="2.5"></value>
+          <value value="3"></value>
+          <value value="3.5"></value>
+          <value value="4"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dog-strategy">
+          <value value="&quot;Surround&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
