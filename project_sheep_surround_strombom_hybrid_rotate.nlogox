@@ -315,6 +315,32 @@ to dog-logic [ rank total-dogs ]
     set target-x sx + (vec-x * 4)
     set target-y sy + (vec-y * 4)
     
+    ;; >>>>> NEW: Detour Logic (Herd Avoidance) <<<<<
+    ;; Prevent dog from running directly through the herd center to catch a sheep.
+    let dist-herd distancexy cx cy
+    let dist-targ distancexy target-x target-y
+    
+    ;; Trigger conditions:
+    ;; 1. Herd center is closer than the target (Herd is in the middle)
+    ;; 2. Dog is close to herd center (Risk of splitting, buffer is radius + 5)
+    if (dist-herd < dist-targ) and (dist-herd < herd-radius + 5) [
+       let ang-herd towardsxy cx cy
+       let ang-targ towardsxy target-x target-y
+       
+       ;; 3. Angle check: If target angle and herd center angle are similar (< 60 deg), path is blocked
+       if abs (subtract-headings ang-herd ang-targ) < 60 [
+          ;; Calculate detour direction: Go left or right?
+          let detour-turn 90
+          if subtract-headings ang-targ ang-herd < 0 [ set detour-turn -90 ]
+          
+          ;; Modify target: Set to a tangent point on the herd edge (radius + 4 safety distance)
+          ;; This makes the dog arc around the herd
+          set target-x cx + (sin (ang-herd + detour-turn) * (herd-radius + 4))
+          set target-y cy + (cos (ang-herd + detour-turn) * (herd-radius + 4))
+       ]
+    ]
+    ;; >>>>> End of Detour Logic <<<<<
+    
   ] [
     ;; CASE B: ALL OTHER DOGS - Use surround logic
     set color orange
@@ -514,9 +540,9 @@ to-report get-tick-100pct report tick-100pct end]]></code>
     <slider x="30" step="0.1" y="665" max="10" width="290" display="alignment-weight" height="50" min="0" direction="Horizontal" default="1.2" variable="alignment-weight"></slider>
     <slider x="30" step="1" y="610" max="100" width="290" display="cohesion-weight" height="50" min="0" direction="Horizontal" default="50.0" variable="cohesion-weight"></slider>
     <slider x="30" step="1" y="445" max="30" width="290" display="max-speed" height="50" min="0" direction="Horizontal" default="5.0" variable="max-speed"></slider>
-    <slider x="30" step="1" y="390" max="500" width="290" display="num-sheep" height="50" min="0" direction="Horizontal" default="100.0" variable="num-sheep"></slider>
+    <slider x="30" step="1" y="390" max="500" width="290" display="num-sheep" height="50" min="0" direction="Horizontal" default="400.0" variable="num-sheep"></slider>
     <slider x="30" step="1" y="285" max="50" width="290" display="herd-threshold" height="50" min="0" direction="Horizontal" default="21.0" variable="herd-threshold"></slider>
-    <slider x="30" step="0.1" y="230" max="20" width="290" display="dog-speed" height="50" min="0" direction="Horizontal" default="5.0" variable="dog-speed"></slider>
+    <slider x="30" step="0.1" y="230" max="20" width="290" display="dog-speed" height="50" min="0" direction="Horizontal" default="2.0" variable="dog-speed"></slider>
     <slider x="30" step="1" y="175" max="50" width="290" display="num-dogs" height="50" min="0" direction="Horizontal" default="3.0" variable="num-dogs"></slider>
     <button x="135" y="15" height="50" disableUntilTicks="false" forever="true" kind="Observer" width="70" display="go">go</button>
     <chooser x="30" y="75" height="60" variable="scenario" current="1" width="205" display="scenario">
